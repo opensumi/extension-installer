@@ -1,0 +1,35 @@
+{
+  "name": "@opensumi/extension-installer",
+  "version": "0.0.1",
+  "main": "lib/index.js",
+  "types": "types/index.d.ts",
+  "files": [
+    "lib",
+    "types"
+  ],
+  "repository": "git@github.com:opensumi/extension-installer.git",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "fmt": "dprint fmt"
+  },
+  "dependencies": {
+    "content-disposition": "^0.5.3",
+    "debug": "^4.3.5",
+    "urllib": "^2.36.1",
+    "yauzl": "^2.10.0"
+  },
+  "devDependencies": {
+    "@types/content-disposition": "^0.5.8",
+    "@types/debug": "^4.1.12",
+    "@types/node": "^20.14.8",
+    "@types/yauzl": "^2.10.3",
+    "dprint": "^0.46.3",
+    "lefthook": "^1.6.18",
+    "typescript": "^5.5.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}
