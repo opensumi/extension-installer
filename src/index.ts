@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { Readable } from "node:stream";
 import * as urllib from "urllib";
 import * as yauzl from "yauzl";
-import { awaitEvent, retry } from "./utils";
+import { awaitEvent, createDeferred, retry } from "./utils";
 
 const debug = debugFactory("InstallExtension");
 
@@ -18,23 +18,14 @@ class ExtensionRequestError extends Error {
   }
 }
 
-export function safeJsonParse<T = any>(jsonStr: string): T | undefined {
-  if (!jsonStr) return;
-  try {
-    return JSON.parse(jsonStr);
-  } catch (err) {
-    console.warn(err);
-  }
-}
-
 export interface RequestHeaders {
   [header: string]: string;
 }
 
 export interface IExtensionInstaller {
-  install(extension: Extension): Promise<string | string[]>;
-  installByRelease(release: ExtensionRelease): Promise<string | string[]>;
-  installByOriginId(extension: OriginExtension): Promise<string | string[]>;
+  install(extension: Extension): Promise<string[]>;
+  installByRelease(release: ExtensionRelease): Promise<string[]>;
+  installByOriginId(extension: OriginExtension): Promise<string[]>;
 }
 
 export enum ExtensionDownloadMode {
@@ -75,9 +66,9 @@ export interface ExtensionInstallerOptions {
    */
   dist?: string;
   /**
-   * api 地址，默认为 https://marketplace.opentrs.cn/
+   * 默认为 https://marketplace.opentrs.cn/
    */
-  api?: string;
+  endpoint?: string;
   /**
    * IDE 框架版本，默认为
    */
@@ -94,6 +85,10 @@ export interface ExtensionInstallerOptions {
    * 跳转 OSS 的地址是否是 http 协议
    */
   isRedirectUrlWithHttpProtocol?: boolean;
+  /**
+   * 是否处理 ExtensionPack 类型的插件
+   */
+  installExtensionPack?: boolean;
   /**
    * proxy 地址
    */
@@ -113,6 +108,7 @@ export interface ExtensionInstallerOptions {
     /**
      * 请求前最后一次拦截
      */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     beforeRequest?: (...args: any[]) => void;
   };
   /**
@@ -257,21 +253,26 @@ const mkdirp = async (dir: string) => {
 };
 
 export class ExtensionInstaller implements IExtensionInstaller {
+  protected endpoint = DEFAULT_API;
+
   constructor(private options: ExtensionInstallerOptions) {
+    if (this.options.endpoint) {
+      this.endpoint = this.options.endpoint;
+    }
   }
 
   private getURL(extension: Extension): string {
-    return `${this.options.api || DEFAULT_API}/openapi/ide/download/${extension.publisher}.${extension.name}${
+    return `${this.endpoint}/openapi/ide/download/${extension.publisher}.${extension.name}${
       extension.version ? "?version=" + extension.version : ""
     }`;
   }
 
   private getReleaseURL(releaseId: string): string {
-    return `${this.options.api || DEFAULT_API}/openapi/ide/download/release/${releaseId}`;
+    return `${this.endpoint}/openapi/ide/download/release/${releaseId}`;
   }
 
   private getOriginURL(extension: OriginExtension): string {
-    return `${this.options.api || DEFAULT_API}/openapi/ide/download/origin/${extension.originId}${
+    return `${this.endpoint}/openapi/ide/download/origin/${extension.originId}${
       extension.version ? "?version=" + extension.version : ""
     }`;
   }
@@ -280,12 +281,9 @@ export class ExtensionInstaller implements IExtensionInstaller {
     return retry(() => createZipFile(zipFilePath), { retries: this.options.retry || 0, delay: 100 });
   }
 
-  /**
-   * 暂时先不处理 extensionPack 的情况
-   */
   private async installExtensionsInPackFromPkg(pkgStr: string, dist: string): Promise<string[]> {
-    const pkg = safeJsonParse(pkgStr);
-    const extensionPack = pkg?.extensionPack;
+    const pkg = JSON.parse(pkgStr);
+    const extensionPack = pkg.extensionPack;
     return extensionPack
       ? await this.installExtensions(
         extensionPack?.map((id: string) => {
@@ -308,65 +306,57 @@ export class ExtensionInstaller implements IExtensionInstaller {
   }
 
   private async checkExtensionType(tmpZipFile: string): Promise<ExtensionType> {
-    return new Promise<ExtensionType>(async (resolve, reject) => {
-      try {
-        const zipFile = await this.createZipFile(tmpZipFile);
+    const deferred = createDeferred<ExtensionType>();
+
+    const zipFile = await this.createZipFile(tmpZipFile);
+
+    zipFile.readEntry();
+    zipFile.on("error", deferred.reject);
+    zipFile.on("entry", (entry) => {
+      if (entry.fileName === "extension/package.json") {
+        deferred.resolve(ExtensionType.OPENSUMI);
+      } else {
         zipFile.readEntry();
-        zipFile.on("error", (e) => {
-          reject(e);
-        });
-
-        zipFile.on("entry", (entry) => {
-          if (entry.fileName === "extension/package.json") {
-            resolve(ExtensionType.OPENSUMI);
-          } else {
-            zipFile.readEntry();
-          }
-        });
-
-        zipFile.on("close", function() {
-          resolve(ExtensionType.JETBRAINS);
-        });
-      } catch (err) {
-        reject(err);
       }
     });
+
+    zipFile.on("close", function() {
+      deferred.resolve(ExtensionType.JETBRAINS);
+    });
+
+    return deferred.promise;
   }
 
   private async checkJarExtension(tmpZipFile: string): Promise<boolean> {
-    return new Promise<boolean>(async (resolve, reject) => {
-      try {
-        const zipFile = await this.createZipFile(tmpZipFile);
+    const deferred = createDeferred<boolean>();
+
+    const zipFile = await this.createZipFile(tmpZipFile);
+
+    zipFile.readEntry();
+    zipFile.on("error", deferred.reject);
+    zipFile.on("entry", (entry) => {
+      // 判断如果文件名是 META-INF，则说明该插件是 jar 文件，应该直接复制
+      if (entry.fileName === "META-INF/") {
+        deferred.resolve(true);
+      } else {
         zipFile.readEntry();
-        zipFile.on("error", (e) => {
-          reject(e);
-        });
-
-        zipFile.on("entry", (entry) => {
-          // 判断如果文件名是 META-INF，则说明该插件是 jar 文件，应该直接复制
-          if (entry.fileName === "META-INF/") {
-            resolve(true);
-          } else {
-            zipFile.readEntry();
-          }
-        });
-
-        zipFile.on("close", function() {
-          resolve(false);
-        });
-      } catch (err) {
-        reject(err);
       }
     });
+
+    zipFile.on("close", function() {
+      deferred.resolve(false);
+    });
+
+    return deferred.promise;
   }
 
-  private async unzip(dist: string, targetDirName: string, tmpZipFile: string): Promise<string | string[]> {
+  private async unzip(dist: string, targetDirName: string, tmpZipFile: string): Promise<string[]> {
     // 如果没传 extensionType 则去检查插件类型
     const type = this.options.extensionType || await this.checkExtensionType(tmpZipFile);
     debug(`${targetDirName} unzip start`);
     const dirs = type === ExtensionType.OPENSUMI
       ? await this.unzipOpenSumiExtension(dist, targetDirName, tmpZipFile)
-      : await this.unzipJetbrainsExtension(dist, targetDirName, tmpZipFile);
+      : [await this.unzipJetBrainsExtension(dist, targetDirName, tmpZipFile)];
     debug(`${targetDirName} unzip finish`);
     return dirs;
   }
@@ -375,75 +365,80 @@ export class ExtensionInstaller implements IExtensionInstaller {
     dist: string,
     targetDirName: string,
     tmpZipFile: string,
-  ): Promise<string | string[]> {
+  ): Promise<string[]> {
     // 解压插件
     const targetPath = await this.unzipFile(dist, targetDirName, tmpZipFile);
-
     const pkg = await fsp.readFile(path.resolve(targetPath, "package.json"), "utf-8");
 
-    const childPaths = await this.installExtensionsInPackFromPkg(pkg, dist);
+    if (this.options.installExtensionPack) {
+      const childPaths = await this.installExtensionsInPackFromPkg(pkg, dist);
+      return [targetPath, ...childPaths];
+    }
 
-    return childPaths?.length > 0 ? [targetPath, ...childPaths] : targetPath;
+    return [targetPath];
   }
 
-  private async unzipJetbrainsExtension(
+  private async unzipJetBrainsExtension(
     dist: string,
     targetDirName: string,
     tmpZipFile: string,
-  ): Promise<string | string[]> {
-    return new Promise<string>(async (resolve, reject) => {
-      try {
-        const isJarExtension = await this.checkJarExtension(tmpZipFile);
-        // 如果是 jar 插件，则直接复制
-        if (isJarExtension) {
-          const dest = path.join(dist, path.basename(tmpZipFile, ".zip") + ".jar");
-          await fsp.cp(tmpZipFile, dest, { recursive: true });
-          resolve(dest);
+  ): Promise<string> {
+    const deferred = createDeferred<string>();
+
+    const isJarExtension = await this.checkJarExtension(tmpZipFile);
+    // 如果是 jar 插件，则直接复制
+    if (isJarExtension) {
+      const dest = path.join(dist, path.basename(tmpZipFile, ".zip") + ".jar");
+      await fsp.cp(tmpZipFile, dest, { recursive: true });
+      deferred.resolve(dest);
+    } else {
+      let readFirst = false;
+      let extensionDirName = "";
+      const zipFile = await this.createZipFile(tmpZipFile);
+      zipFile.readEntry();
+      zipFile.on("error", deferred.reject);
+      zipFile.on("close", () => {
+        if (!extensionDirName) {
+          deferred.reject(new Error("Download Error: cannot get extension dir name from zip file"));
+          return;
+        }
+
+        fsp.rm(tmpZipFile)
+          .then(() => deferred.resolve(path.join(dist, extensionDirName)))
+          .catch(deferred.reject);
+      });
+
+      zipFile.on("entry", (entry) => {
+        const targetFileName = path.join(dist, entry.fileName);
+        if (/\/$/.test(entry.fileName)) {
+          if (!readFirst) {
+            // jetbrains 插件下只有一个文件夹，这个文件夹名就是下载插件目录的名称
+            extensionDirName = entry.fileName;
+            readFirst = true;
+          }
+          mkdirp(targetFileName)
+            .then(() => zipFile.readEntry())
+            .catch(deferred.reject);
         } else {
-          let readFirst = false;
-          let extensionDirName = "";
-          const zipFile = await this.createZipFile(tmpZipFile);
-          zipFile.readEntry();
-          zipFile.on("error", (e) => {
-            reject(e);
-          });
-
-          zipFile.on("close", () => {
-            fsp.rm(tmpZipFile).then(() => resolve(path.join(dist, extensionDirName)));
-          });
-
-          zipFile.on("entry", (entry) => {
-            const targetFileName = path.join(dist, entry.fileName);
-            if (/\/$/.test(entry.fileName)) {
-              if (!readFirst) {
-                // jetbrains 插件下只有一个文件夹，这个文件夹名就是下载插件目录的名称
-                extensionDirName = entry.fileName;
-                readFirst = true;
-              }
-              mkdirp(targetFileName).then(() => zipFile.readEntry());
-            } else {
-              zipFile.openReadStream(entry, (err, readStream) => {
-                if (err) {
-                  reject(err);
-                } else {
-                  readStream.on("end", () => {
-                    zipFile.readEntry();
-                  });
-                  mkdirp(path.dirname(targetFileName)).then(() =>
-                    readStream.pipe(fs.createWriteStream(targetFileName))
-                  );
-                }
-              });
+          zipFile.openReadStream(entry, (err, readStream) => {
+            if (err) {
+              deferred.reject(err);
+              return;
             }
+            readStream.on("end", () => {
+              zipFile.readEntry();
+            });
+            mkdirp(path.dirname(targetFileName))
+              .then(() => readStream.pipe(fs.createWriteStream(targetFileName)))
+              .catch(deferred.reject);
           });
         }
-      } catch (err) {
-        reject(err);
-      }
-    });
+      });
+    }
+    return deferred.promise;
   }
 
-  private async _installByRelease(release: ExtensionRelease): Promise<string | string[]> {
+  private async _installByRelease(release: ExtensionRelease): Promise<string[]> {
     if (!release.releaseId) {
       throw new Error("releaseId is required");
     }
@@ -461,7 +456,7 @@ export class ExtensionInstaller implements IExtensionInstaller {
     return this.unzip(dist, targetDirName, tmpZipFile);
   }
 
-  private async _installByOriginId(extension: OriginExtension): Promise<string | string[]> {
+  private async _installByOriginId(extension: OriginExtension): Promise<string[]> {
     if (!extension.originId) {
       throw new Error("releaseId is required");
     }
@@ -478,7 +473,7 @@ export class ExtensionInstaller implements IExtensionInstaller {
     return this.unzip(dist, targetDirName, tmpZipFile);
   }
 
-  private async _install(extension: Extension): Promise<string | string[]> {
+  private async _install(extension: Extension): Promise<string[]> {
     const dist = extension.dist || this.options.dist;
     if (!dist) {
       throw new Error("dist is required");
@@ -494,14 +489,14 @@ export class ExtensionInstaller implements IExtensionInstaller {
     return this.unzip(dist, targetDirName, tmpZipFile);
   }
 
-  private retry(fn: () => Promise<string | string[]>): Promise<string | string[]> {
+  private retry<T>(fn: () => Promise<T>): Promise<T> {
     return retry(async (bail) => {
       try {
         return await fn();
       } catch (e) {
         debug("extension install error", e);
         // 不对插件 403, 404 的错误进行重试
-        if ([403, 404].includes((e as any).status)) {
+        if ([403, 404].includes((e as urllib.HttpClientRequestError).status!)) {
           bail(e as Error);
         }
         throw e;
@@ -512,92 +507,91 @@ export class ExtensionInstaller implements IExtensionInstaller {
     });
   }
 
-  public install(extension: Extension): Promise<string | string[]> {
+  public install(extension: Extension): Promise<string[]> {
     return this.retry(() => this._install(extension));
   }
 
-  public installByRelease(release: ExtensionRelease): Promise<string | string[]> {
+  public installByRelease(release: ExtensionRelease): Promise<string[]> {
     return this.retry(() => this._installByRelease(release));
   }
 
-  public installByOriginId(extension: OriginExtension): Promise<string | string[]> {
+  public installByOriginId(extension: OriginExtension): Promise<string[]> {
     return this.retry(() => this._installByOriginId(extension));
   }
 
-  private unzipFile(dist: string, targetDirName: string, tmpZipFile: string): Promise<string> {
+  private async unzipFile(dist: string, targetDirName: string, tmpZipFile: string): Promise<string> {
     const sourcePathRegex = new RegExp("^extension");
-    return new Promise<string>(async (resolve, reject) => {
-      try {
-        const extensionDir = path.join(dist, targetDirName);
-        // 创建插件目录
-        await fsp.mkdir(extensionDir, { recursive: true });
+    const deferred = createDeferred<string>();
 
-        const zipFile = await createZipFile(tmpZipFile);
-        zipFile.readEntry();
-        zipFile.on("error", (e) => {
-          reject(e);
-        });
+    const extensionDir = path.join(dist, targetDirName);
+    // 创建插件目录
+    await fsp.mkdir(extensionDir, { recursive: true });
 
-        zipFile.on("close", () => {
-          if (!fs.existsSync(path.join(extensionDir, "package.json"))) {
-            reject(`Download Error: ${extensionDir}/package.json`);
-            return;
-          }
-          fsp.rm(tmpZipFile).then(() => resolve(extensionDir));
-        });
+    const zipFile = await createZipFile(tmpZipFile);
+    zipFile.readEntry();
+    zipFile.on("error", deferred.reject);
 
-        zipFile.on("entry", (entry) => {
-          if (!sourcePathRegex.test(entry.fileName)) {
-            zipFile.readEntry();
-            return;
-          }
-          let fileName = entry.fileName.replace(sourcePathRegex, "");
-
-          if (/\/$/.test(fileName)) {
-            const targetFileName = path.join(extensionDir, fileName);
-            fsp.mkdir(targetFileName, {
-              recursive: true,
-            }).then(() => zipFile.readEntry());
-            return;
-          }
-
-          let originalFileName: string;
-          // 在 Electron 中，如果解包的文件中存在 .asar 文件，会由于 Electron 本身的 bug 导致无法对 .asar 创建 writeStream
-          // 此处先把 .asar 文件写到另外一个目标文件中，完成后再进行重命名
-          if (fileName.endsWith(".asar") && this.options.isElectronEnv) {
-            originalFileName = fileName;
-            fileName += "_prevent_bug";
-          }
-          const readStream = openZipStream(zipFile, entry);
-          const mode = modeFromEntry(entry);
-          readStream.then((stream) => {
-            const dirname = path.dirname(fileName);
-            const targetDirName = path.join(extensionDir, dirname);
-            if (targetDirName.indexOf(extensionDir) !== 0) {
-              throw new Error(`invalid file path ${targetDirName}`);
-            }
-            const targetFileName = path.join(extensionDir, fileName);
-
-            mkdirp(targetDirName)
-              .then(() => {
-                const writerStream = fs.createWriteStream(targetFileName, { mode });
-                writerStream.on("close", async () => {
-                  if (originalFileName) {
-                    // rename .asar, if filename has been modified
-                    fs.renameSync(targetFileName, path.join(extensionDir, originalFileName));
-                  }
-                  zipFile.readEntry();
-                });
-                stream.on("error", (err) => {
-                  throw err;
-                });
-                stream.pipe(writerStream);
-              });
-          });
-        });
-      } catch (err) {
-        reject(err);
+    zipFile.on("close", () => {
+      if (!fs.existsSync(path.join(extensionDir, "package.json"))) {
+        deferred.reject(new Error(`Download Error: ${extensionDir}/package.json`));
+        return;
       }
+      fsp.rm(tmpZipFile).then(() => deferred.resolve(extensionDir)).catch(err => {
+        deferred.reject(err);
+      });
     });
+
+    zipFile.on("entry", (entry) => {
+      if (!sourcePathRegex.test(entry.fileName)) {
+        zipFile.readEntry();
+        return;
+      }
+      let fileName = entry.fileName.replace(sourcePathRegex, "");
+
+      if (/\/$/.test(fileName)) {
+        const targetFileName = path.join(extensionDir, fileName);
+        mkdirp(targetFileName).then(() => zipFile.readEntry()).catch(err => {
+          deferred.reject(err);
+        });
+        return;
+      }
+
+      let originalFileName: string;
+      // 在 Electron 中，如果解包的文件中存在 .asar 文件，会由于 Electron 本身的 bug 导致无法对 .asar 创建 writeStream
+      // 此处先把 .asar 文件写到另外一个目标文件中，完成后再进行重命名
+      if (fileName.endsWith(".asar") && this.options.isElectronEnv) {
+        originalFileName = fileName;
+        fileName += "_prevent_bug";
+      }
+
+      const dirname = path.dirname(fileName);
+      const targetDirName = path.join(extensionDir, dirname);
+      if (targetDirName.indexOf(extensionDir) !== 0) {
+        throw new Error(`invalid file path ${targetDirName}`);
+      }
+
+      const targetFileName = path.join(extensionDir, fileName);
+
+      const readStream = openZipStream(zipFile, entry);
+      const mode = modeFromEntry(entry);
+      readStream.then((stream) => {
+        mkdirp(targetDirName)
+          .then(() => {
+            const writeStream = fs.createWriteStream(targetFileName, { mode });
+            writeStream.on("close", () => {
+              if (originalFileName) {
+                // rename .asar, if filename has been modified
+                fsp.rename(targetFileName, path.join(extensionDir, originalFileName))
+                  .catch(deferred.reject);
+              }
+              zipFile.readEntry();
+            });
+            stream.on("error", deferred.reject);
+            stream.pipe(writeStream);
+          }).catch(deferred.reject);
+      });
+    });
+
+    return deferred.promise;
   }
 }

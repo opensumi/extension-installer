@@ -36,7 +36,7 @@ export const retry = async <T>(
   options: {
     delay: number;
     retries: number;
-    onFailedAttempt?: (error: any) => void;
+    onFailedAttempt?: (error: unknown) => void;
     timeout?: number;
   },
 ): Promise<T> => {
@@ -71,4 +71,21 @@ export const retry = async <T>(
     await sleep(delay);
     return retry(task, { delay, retries: retries - 1, onFailedAttempt, timeout });
   }
+};
+
+export interface IDeferred<T> {
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+  promise: Promise<T>;
+}
+
+export const createDeferred = <T>(): IDeferred<T> => {
+  let resolve: (value: T) => void;
+  let reject: (error: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, resolve: resolve!, reject: reject! };
 };
