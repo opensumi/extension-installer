@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { Readable } from "node:stream";
 import * as urllib from "urllib";
 import * as yauzl from "yauzl";
-import { awaitEvent, createDeferred, retry } from "./utils";
+import { awaitEvent, createPromiseResolvers, retry } from "./utils";
 
 const debug = debugFactory("InstallExtension");
 
@@ -306,48 +306,44 @@ export class ExtensionInstaller implements IExtensionInstaller {
   }
 
   private async checkExtensionType(tmpZipFile: string): Promise<ExtensionType> {
-    const deferred = createDeferred<ExtensionType>();
+    const resolvers = createPromiseResolvers<ExtensionType>();
 
     const zipFile = await this.createZipFile(tmpZipFile);
-
     zipFile.readEntry();
-    zipFile.on("error", deferred.reject);
     zipFile.on("entry", (entry) => {
       if (entry.fileName === "extension/package.json") {
-        deferred.resolve(ExtensionType.OPENSUMI);
+        resolvers.resolve(ExtensionType.OPENSUMI);
       } else {
         zipFile.readEntry();
       }
     });
-
     zipFile.on("close", function() {
-      deferred.resolve(ExtensionType.JETBRAINS);
+      resolvers.resolve(ExtensionType.JETBRAINS);
     });
+    zipFile.on("error", resolvers.reject);
 
-    return deferred.promise;
+    return resolvers.promise;
   }
 
   private async checkJarExtension(tmpZipFile: string): Promise<boolean> {
-    const deferred = createDeferred<boolean>();
+    const resolvers = createPromiseResolvers<boolean>();
 
     const zipFile = await this.createZipFile(tmpZipFile);
-
     zipFile.readEntry();
-    zipFile.on("error", deferred.reject);
     zipFile.on("entry", (entry) => {
       // 判断如果文件名是 META-INF，则说明该插件是 jar 文件，应该直接复制
       if (entry.fileName === "META-INF/") {
-        deferred.resolve(true);
+        resolvers.resolve(true);
       } else {
         zipFile.readEntry();
       }
     });
-
     zipFile.on("close", function() {
-      deferred.resolve(false);
+      resolvers.resolve(false);
     });
+    zipFile.on("error", resolvers.reject);
 
-    return deferred.promise;
+    return resolvers.promise;
   }
 
   private async unzip(dist: string, targetDirName: string, tmpZipFile: string): Promise<string[]> {
@@ -383,31 +379,19 @@ export class ExtensionInstaller implements IExtensionInstaller {
     targetDirName: string,
     tmpZipFile: string,
   ): Promise<string> {
-    const deferred = createDeferred<string>();
+    const resolvers = createPromiseResolvers<string>();
 
     const isJarExtension = await this.checkJarExtension(tmpZipFile);
     // 如果是 jar 插件，则直接复制
     if (isJarExtension) {
       const dest = path.join(dist, path.basename(tmpZipFile, ".zip") + ".jar");
       await fsp.cp(tmpZipFile, dest, { recursive: true });
-      deferred.resolve(dest);
+      resolvers.resolve(dest);
     } else {
       let readFirst = false;
       let extensionDirName = "";
       const zipFile = await this.createZipFile(tmpZipFile);
       zipFile.readEntry();
-      zipFile.on("error", deferred.reject);
-      zipFile.on("close", () => {
-        if (!extensionDirName) {
-          deferred.reject(new Error("Download Error: cannot get extension dir name from zip file"));
-          return;
-        }
-
-        fsp.rm(tmpZipFile)
-          .then(() => deferred.resolve(path.join(dist, extensionDirName)))
-          .catch(deferred.reject);
-      });
-
       zipFile.on("entry", (entry) => {
         const targetFileName = path.join(dist, entry.fileName);
         if (/\/$/.test(entry.fileName)) {
@@ -418,11 +402,11 @@ export class ExtensionInstaller implements IExtensionInstaller {
           }
           mkdirp(targetFileName)
             .then(() => zipFile.readEntry())
-            .catch(deferred.reject);
+            .catch(resolvers.reject);
         } else {
           zipFile.openReadStream(entry, (err, readStream) => {
             if (err) {
-              deferred.reject(err);
+              resolvers.reject(err);
               return;
             }
             readStream.on("end", () => {
@@ -430,12 +414,23 @@ export class ExtensionInstaller implements IExtensionInstaller {
             });
             mkdirp(path.dirname(targetFileName))
               .then(() => readStream.pipe(fs.createWriteStream(targetFileName)))
-              .catch(deferred.reject);
+              .catch(resolvers.reject);
           });
         }
       });
+      zipFile.on("error", resolvers.reject);
+      zipFile.on("close", () => {
+        if (!extensionDirName) {
+          resolvers.reject(new Error("Download Error: cannot get extension dir name from zip file"));
+          return;
+        }
+
+        fsp.rm(tmpZipFile)
+          .then(() => resolvers.resolve(path.join(dist, extensionDirName)))
+          .catch(resolvers.reject);
+      });
     }
-    return deferred.promise;
+    return resolvers.promise;
   }
 
   private async _installByRelease(release: ExtensionRelease): Promise<string[]> {
@@ -521,7 +516,7 @@ export class ExtensionInstaller implements IExtensionInstaller {
 
   private async unzipFile(dist: string, targetDirName: string, tmpZipFile: string): Promise<string> {
     const sourcePathRegex = new RegExp("^extension");
-    const deferred = createDeferred<string>();
+    const resolvers = createPromiseResolvers<string>();
 
     const extensionDir = path.join(dist, targetDirName);
     // 创建插件目录
@@ -529,16 +524,17 @@ export class ExtensionInstaller implements IExtensionInstaller {
 
     const zipFile = await createZipFile(tmpZipFile);
     zipFile.readEntry();
-    zipFile.on("error", deferred.reject);
+    zipFile.on("error", resolvers.reject);
 
     zipFile.on("close", () => {
-      if (!fs.existsSync(path.join(extensionDir, "package.json"))) {
-        deferred.reject(new Error(`Download Error: ${extensionDir}/package.json`));
-        return;
-      }
-      fsp.rm(tmpZipFile).then(() => deferred.resolve(extensionDir)).catch(err => {
-        deferred.reject(err);
-      });
+      fsp.access(path.join(extensionDir, "package.json"))
+        .then(() => {
+          resolvers.resolve(extensionDir);
+        })
+        .catch(err => {
+          resolvers.reject(new Error(`Download Error: ${extensionDir}/package.json can not access: ` + err.message));
+        });
+      fsp.rm(tmpZipFile);
     });
 
     zipFile.on("entry", (entry) => {
@@ -551,7 +547,7 @@ export class ExtensionInstaller implements IExtensionInstaller {
       if (/\/$/.test(fileName)) {
         const targetFileName = path.join(extensionDir, fileName);
         mkdirp(targetFileName).then(() => zipFile.readEntry()).catch(err => {
-          deferred.reject(err);
+          resolvers.reject(err);
         });
         return;
       }
@@ -582,16 +578,16 @@ export class ExtensionInstaller implements IExtensionInstaller {
               if (originalFileName) {
                 // rename .asar, if filename has been modified
                 fsp.rename(targetFileName, path.join(extensionDir, originalFileName))
-                  .catch(deferred.reject);
+                  .catch(resolvers.reject);
               }
               zipFile.readEntry();
             });
-            stream.on("error", deferred.reject);
+            stream.on("error", resolvers.reject);
             stream.pipe(writeStream);
-          }).catch(deferred.reject);
+          }).catch(resolvers.reject);
       });
     });
 
-    return deferred.promise;
+    return resolvers.promise;
   }
 }

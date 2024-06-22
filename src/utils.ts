@@ -79,7 +79,7 @@ export interface IDeferred<T> {
   promise: Promise<T>;
 }
 
-export const createDeferred = <T>(): IDeferred<T> => {
+export const createPromiseResolvers = <T>(): IDeferred<T> => {
   let resolve: (value: T) => void;
   let reject: (error: Error) => void;
   const promise = new Promise<T>((res, rej) => {
