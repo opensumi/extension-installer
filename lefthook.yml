@@ -1,13 +1,7 @@
 pre-commit:
-  parallel: true
   commands:
-    frontend-linter:
+    linter:
       run: yarn eslint {staged_files}
-    backend-linter:
-      run: bundle exec rubocop --force-exclusion {all_files}
-    frontend-style:
-      files: git diff --name-only HEAD @{push}
-      run: yarn stylelint {files}
-
-pre-push:
-  parallel: true
+    style:
+      run: yarn fmt {staged_files}
+      stage_fixed: true
