@@ -15,7 +15,8 @@
     "lint": "eslint",
     "test": "vitest",
     "coverage": "vitest run --coverage",
-    "release": "commit-and-tag-version"
+    "release": "commit-and-tag-version",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "content-disposition": "^0.5.4",
