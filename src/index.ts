@@ -132,7 +132,7 @@ export interface Extension {
    */
   version?: string;
   /**
-   *  目标下载地址
+   *  下载地址
    */
   dist?: string;
 }
@@ -140,7 +140,7 @@ export interface Extension {
 export interface ExtensionRelease {
   releaseId: string;
   /**
-   *  目标下载地址
+   *  下载地址
    */
   dist?: string;
 }
@@ -281,36 +281,13 @@ export class ExtensionInstaller implements IExtensionInstaller {
     return retry(() => createZipFile(zipFilePath), { retries: this.options.retry || 0, delay: 100 });
   }
 
-  private async installExtensionsInPackFromPkg(pkgStr: string, dist: string): Promise<string[]> {
-    const pkg = JSON.parse(pkgStr);
-    const extensionPack = pkg.extensionPack;
-    return extensionPack
-      ? await this.installExtensions(
-        extensionPack?.map((id: string) => {
-          const [publisher, name] = id.split(".");
-          return {
-            publisher,
-            name,
-            dist,
-          };
-        }),
-      )
-      : [];
-  }
-
-  private async installExtensions(exts: Extension[], maxParallel?: number): Promise<string[]> {
-    let result: string[][] = [];
-    if (maxParallel) {
-      result = await parallelRunPromise(
-        exts.map((e: Extension) => {
-          return () => this.install(e);
-        }),
-        maxParallel,
-      );
-    } else {
-      result = await Promise.all(exts.map((e: Extension) => this.install(e)));
-    }
-
+  public async installExtensions(exts: Extension[], maxParallel = 10): Promise<string[]> {
+    const result = await parallelRunPromise(
+      exts.map((e: Extension) => {
+        return () => this.install(e);
+      }),
+      maxParallel,
+    );
     return result.flat(Infinity) as string[];
   }
 
@@ -373,10 +350,28 @@ export class ExtensionInstaller implements IExtensionInstaller {
   ): Promise<string[]> {
     // 解压插件
     const targetPath = await this.unzipFile(dist, targetDirName, tmpZipFile);
-    const pkg = await fsp.readFile(path.resolve(targetPath, "package.json"), "utf-8");
 
     if (this.options.installExtensionPack) {
-      const childPaths = await this.installExtensionsInPackFromPkg(pkg, dist);
+      const pkgStr = await fsp.readFile(path.resolve(targetPath, "package.json"), "utf-8");
+      const pkg = JSON.parse(pkgStr) as {
+        extensionPack: string[];
+      };
+      const extensionPack = pkg.extensionPack;
+      let childPaths = [] as string[];
+      if (extensionPack) {
+        childPaths = await this.installExtensions(
+          extensionPack?.map((id: string) => {
+            const [publisher, name] = id.split(".");
+            return {
+              publisher,
+              name,
+              dist,
+            };
+          }),
+          3,
+        );
+      }
+
       return [targetPath, ...childPaths];
     }
 
