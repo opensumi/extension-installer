@@ -89,3 +89,36 @@ export const createPromiseResolvers = <T>(): IDeferred<T> => {
 
   return { promise, resolve: resolve!, reject: reject! };
 };
+
+// 限制并发数，运行promise
+export const parallelRunPromise = <T>(lazyPromises: (() => Promise<T>)[], n: number) => {
+  const results: T[] = [];
+  let index = 0;
+  let working = 0;
+  let complete = 0;
+
+  const addWorking = (resolve: (value: T[]) => void, reject: (error: Error) => void) => {
+    while (working < n && index < lazyPromises.length) {
+      const current = lazyPromises[index++];
+      working++;
+
+      ((index) => {
+        current().then((result) => {
+          working--;
+          complete++;
+          results[index] = result;
+
+          if (complete === lazyPromises.length) {
+            resolve(results);
+            return;
+          }
+
+          // note: 虽然addWorking中有while，这里其实每次只会加一个promise
+          addWorking(resolve, reject);
+        }, reject);
+      })(index - 1);
+    }
+  };
+
+  return new Promise(addWorking);
+};

@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { Readable } from "node:stream";
 import * as urllib from "urllib";
 import * as yauzl from "yauzl";
-import { awaitEvent, createPromiseResolvers, retry } from "./utils";
+import { awaitEvent, createPromiseResolvers, parallelRunPromise, retry } from "./utils";
 
 const debug = debugFactory("InstallExtension");
 
@@ -298,10 +298,19 @@ export class ExtensionInstaller implements IExtensionInstaller {
       : [];
   }
 
-  private async installExtensions(exts: Extension[]): Promise<string[]> {
-    const result = await Promise.all(exts.map((e: Extension) => {
-      return this.install(e);
-    }));
+  private async installExtensions(exts: Extension[], maxParallel?: number): Promise<string[]> {
+    let result: string[][] = [];
+    if (maxParallel) {
+      result = await parallelRunPromise(
+        exts.map((e: Extension) => {
+          return () => this.install(e);
+        }),
+        maxParallel,
+      );
+    } else {
+      result = await Promise.all(exts.map((e: Extension) => this.install(e)));
+    }
+
     return result.flat(Infinity) as string[];
   }
 
